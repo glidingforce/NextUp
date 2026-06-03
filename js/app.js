@@ -120,6 +120,18 @@ function cmToFtIn(cm){const i=cm/2.54;return{ft:Math.floor(i/12),inches:Math.rou
 function ftInToCm(ft,i){return Math.round((ft*12+i)*2.54*10)/10;}
 function lbsToNearestKg(lbs){return Math.round(parseFloat(lbs)/2.2046*2)/2;}
 
+
+// Minimal template for new programs (not the full default workout)
+const PROGRAM_TEMPLATE = [
+  { key:'tmpl_push', name:'Workout A', icon:'💪', exercises:[
+    { id:1, name:'Exercise 1', sets:3, reps:'8-12', weight:0, rest:60, notes:'Tap ✏️ to edit' },
+    { id:2, name:'Exercise 2', sets:3, reps:'8-12', weight:0, rest:60, notes:'' },
+  ]},
+  { key:'tmpl_pull', name:'Workout B', icon:'🔙', exercises:[
+    { id:1, name:'Exercise 1', sets:3, reps:'8-12', weight:0, rest:60, notes:'' },
+  ]},
+];
+
 // ─── Smart lbs — nearest real dumbbell weight ───────────────
 const COMMON_LBS_DB=[2.5,5,7.5,10,12.5,15,17.5,20,22.5,25,27.5,30,35,40,45,
   50,55,60,65,70,75,80,85,90,95,100,110,120,130,140,150];
@@ -195,7 +207,7 @@ let _activeProg='default';
 function _loadPrograms(){
   const uid=currentUser?currentUser.id:'guest';
   const s=localStorage.getItem('nu_'+uid+'_progs');
-  _programs=s?JSON.parse(s):[{key:'default',name:'Main Program'}];
+  _programs=s?JSON.parse(s).map(p=>Object.assign({driveFileId:null},p)):[{key:'default',name:'Main Program',driveFileId:null}];
   _activeProg=localStorage.getItem('nu_'+uid+'_active_prog')||'default';
   if(!_programs.find(p=>p.key===_activeProg))_activeProg=_programs[0].key;
 }
@@ -221,9 +233,11 @@ function _switchProgram(key){
 }
 function _createProgram(name){
   const key='prog_'+Date.now();
-  _programs.push({key,name});
+  _programs.push({key,name,driveFileId:null});
   _savePrograms();
-  localStorage.setItem(skP('workouts',key),JSON.stringify(JSON.parse(JSON.stringify(DEFAULT_WORKOUTS))));
+  // Use minimal template — not the full default workout
+  const tpl=PROGRAM_TEMPLATE.map(w=>Object.assign({},w,{key:w.key+'_'+key,exercises:w.exercises.map(e=>Object.assign({},e))}));
+  localStorage.setItem(skP('workouts',key),JSON.stringify(tpl));
   _activeProg=key;
   const uid=currentUser?currentUser.id:'guest';
   localStorage.setItem('nu_'+uid+'_active_prog',key);
@@ -236,9 +250,23 @@ function _deleteProgram(key){
   if(_activeProg===key){_activeProg=_programs[0].key;const uid=currentUser?currentUser.id:'guest';localStorage.setItem('nu_'+uid+'_active_prog',_activeProg);}
   loadData();render();
 }
-function _renameProgram(key,name){
+async function _renameProgram(key,name){
   const p=_programs.find(p=>p.key===key);
-  if(p){p.name=name;_savePrograms();}
+  if(!p) return;
+  p.name=name;
+  _savePrograms();
+  render(); // update UI bar immediately
+  // Rename the Drive file too
+  const tok=getToken();
+  if(tok&&p.driveFileId){
+    try{
+      await fetch('https://www.googleapis.com/drive/v3/files/'+p.driveFileId,
+        {method:'PATCH',headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},
+         body:JSON.stringify({name:name+'.xlsx'})});
+      const fid=_driveFolderId||localStorage.getItem(sk('dfid'));
+      if(fid) await _saveManifest(tok,fid);
+    }catch(e){console.warn('Drive rename:',e);}
+  }
 }
 
 // ─── Storage (user + program scoped) ───────────────────────
@@ -275,9 +303,14 @@ let _syncStatus='idle';
 function _setSyncStatus(s){
   _syncStatus=s;
   const el=document.getElementById('sync-ind');if(!el)return;
-  const map={idle:'☁',syncing:'🔄',ok:'✅',error:'⚠️'};
-  el.textContent=map[s]||'';
-  el.title=s==='ok'?'Synced':s==='syncing'?'Syncing...':s==='error'?'Sync error':'Tap to sync';
+  // Icon spans with CSS colour classes
+  const icons={
+    idle:'<span class="sico sico-idle" title="Tap to sync">&#9729;</span>',
+    syncing:'<span class="sico sico-spin" title="Syncing...">&#10227;</span>',
+    ok:'<span class="sico sico-ok" title="Synced ✓">&#10003;</span>',
+    error:'<span class="sico sico-err" title="Sync error — tap to retry">!</span>',
+  };
+  el.innerHTML=icons[s]||icons.idle;
 }
 function _progDriveFilename(){return (_getActiveProg().name||'Workouts')+'.xlsx';}
 
@@ -406,12 +439,15 @@ async function syncAppToDrive(){
     const sd=await sr.json();
     const existId=sd.files&&sd.files.length?sd.files[0].id:null;
     const uploadedId=await _uploadDrive(tok,bytes,existId,fid,fname);
+    // Save file ID in the program object so rename/sync always finds the right file
+    const progObj=_getActiveProg();
+    if(progObj){progObj.driveFileId=uploadedId;_savePrograms();}
     localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+uploadedId+'/view');
     await _syncImgsToDrive(tok,imgFid);
     await _saveManifest(tok,fid); // save programs list + profile
     _setSyncStatus('ok');
     alert('✅ Synced to Drive\n📊 '+fname+'\n\nOpen in Google Sheets to edit, then use Drive → App to sync back.');
-  }catch(e){console.error('syncAppToDrive',e);_setSyncStatus('error');alert('Sync failed: '+e.message);}
+  }catch(e){console.error('syncAppToDrive',e);_setSyncStatus('error');openModal('syncError',{msg:e.message,dir:'toDrive'});}
 }
 
 // ── programs.json manifest — stores programs list + profile ──
@@ -456,11 +492,25 @@ async function syncDriveToApp(){
   try{
     const{fid,imgFid}=await _ensureFolders(tok);
     const fname=_progDriveFilename();
-    const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
-    const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
-    const sd=await sr.json();
-    if(!sd.files||!sd.files.length){_setSyncStatus('idle');if(confirm('No file "'+fname+'" on Drive.\nCreate it from current app data?'))await syncAppToDrive();return;}
-    const fileId=sd.files[0].id;
+    const progObj=_getActiveProg();
+    let fileId=null;
+    // Try cached driveFileId first (survives renames)
+    if(progObj&&progObj.driveFileId){
+      const chk=await fetch('https://www.googleapis.com/drive/v3/files/'+progObj.driveFileId+'?fields=id',{headers:{Authorization:'Bearer '+tok}});
+      if(chk.ok) fileId=progObj.driveFileId;
+      else{ if(progObj)progObj.driveFileId=null; _savePrograms(); }
+    }
+    // Fallback: search by filename
+    if(!fileId){
+      const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
+      const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
+      const sd=await sr.json();
+      if(sd.files&&sd.files.length){
+        fileId=sd.files[0].id;
+        if(progObj){progObj.driveFileId=fileId;_savePrograms();}
+      }
+    }
+    if(!fileId){_setSyncStatus('error');openModal('driveNotFound',{fname});return;}
     localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+fileId+'/view');
     const r=await fetch('https://www.googleapis.com/drive/v3/files/'+fileId+'?alt=media',{headers:{Authorization:'Bearer '+tok}});
     if(!r.ok)throw new Error('download '+r.status);
@@ -471,7 +521,7 @@ async function syncDriveToApp(){
     await _syncImgsFromDrive(tok,imgFid);
     _setSyncStatus('ok');render();
     alert('✅ Loaded from Drive\n📊 '+fname+'\nImages also synced.');
-  }catch(e){console.error('syncDriveToApp',e);_setSyncStatus('error');alert('Sync failed: '+e.message);}
+  }catch(e){console.error('syncDriveToApp',e);_setSyncStatus('error');openModal('syncError',{msg:e.message,dir:'toApp'});}
 }
 
 async function checkDriveOnLogin(){
@@ -499,6 +549,33 @@ async function checkDriveOnLogin(){
       }
       render(); // show programs bar + profile subtitle immediately
     }
+
+    // ── Step 1b: discover all xlsx files in Drive folder ─────
+    try{
+      const lr=await fetch(
+        "https://www.googleapis.com/drive/v3/files?q="+
+        encodeURIComponent("'"+fid+"' in parents and name contains '.xlsx' and trashed=false")+
+        "&fields=files(id,name)",
+        {headers:{Authorization:'Bearer '+tok}});
+      const ld=await lr.json();
+      let filesChanged=false;
+      if(ld.files){
+        ld.files.forEach(f=>{
+          const pName=f.name.replace(/\.xlsx$/i,'');
+          // Match by stored ID first, then by name
+          let existing=_programs.find(p=>p.driveFileId===f.id);
+          if(!existing) existing=_programs.find(p=>p.name===pName);
+          if(!existing){
+            // New file found in Drive — add as a program
+            _programs.push({key:'drv_'+Date.now()+'_'+Math.random().toString(36).slice(2),name:pName,driveFileId:f.id});
+            filesChanged=true;
+          } else if(!existing.driveFileId){
+            existing.driveFileId=f.id; filesChanged=true;
+          }
+        });
+        if(filesChanged){_savePrograms();render();}
+      }
+    }catch(e){console.warn('discover xlsx',e);}
 
     // ── Step 2: load active program's Excel ───────────────────
     const fname=_progDriveFilename();
@@ -781,37 +858,94 @@ function renderModal(){
   } else if(S.modal.type==='syncDrive'){
     const driveLink=localStorage.getItem(sk('drive_link_'+_activeProg))||'';
     const fname=_progDriveFilename();
-    inner='<div class="modal-title">☁ '+(lang==='he'?'סנכרון עם Drive':'Sync with Drive')+'</div>'+
-      '<div class="drive-info-box">'+
+    const confirmDir=S.modal.data.confirm||null;
+    function _sdCard(dir,arrowHtml,title,desc){
+      const active=confirmDir===dir;
+      return '<div class="sync-dir-card'+(active?' confirming':'')+'" data-a="preSyncDir" data-dir="'+dir+'">'+
+        '<div class="sync-dir-arrow">'+arrowHtml+'</div>'+
+        '<div class="sync-dir-text">'+
+        '<div class="sync-dir-title">'+title+'</div>'+
+        '<div class="sync-dir-desc">'+desc+'</div>'+
+        '</div>'+
+        '<div class="sync-dir-chevron">'+(active?'▲':'▼')+'</div>'+
+        '</div>'+
+        (active?
+          '<div class="sync-confirm-box">'+
+          '<p class="sync-confirm-msg">'+(dir==='toDrive'?
+            (lang==='he'?'תחליף את "'+esc(fname)+'" ב-Drive בנתוני האפליקציה?':'Overwrite "'+esc(fname)+'" on Drive with current app data?'):
+            (lang==='he'?'תחליף את נתוני האפליקציה מ-"'+esc(fname)+'" ב-Drive?':'Replace app workouts with "'+esc(fname)+'" from Drive?'))+
+          '</p>'+
+          '<div class="sync-confirm-btns">'+
+          '<button class="btn btn-ghost sync-confirm-cancel" data-a="cancelSyncConfirm">'+t('cancel')+'</button>'+
+          '<button class="btn sync-confirm-go" data-a="doSync" data-dir="'+dir+'">✓ '+(lang==='he'?'אשר':'Confirm Sync')+'</button>'+
+          '</div></div>':'');
+    }
+    inner='<div class="modal-title sync-modal-title">'+
+      '<span class="sico sico-'+_syncStatus+'" style="font-size:18px;margin-right:8px;">'+(
+        _syncStatus==='ok'?'&#10003;':_syncStatus==='syncing'?'&#10227;':_syncStatus==='error'?'!':'&#9729;')+
+      '</span>'+(lang==='he'?'סנכרון עם Drive':'Sync with Drive')+'</div>'+
+      '<div class="drive-info-box" style="margin-bottom:14px;">'+
       '<p style="font-size:13px;font-weight:600;margin-bottom:4px;">📊 '+esc(fname)+'</p>'+
-      '<p style="font-size:11px;color:var(--gray);margin-bottom:8px;">'+t('driveNote')+'</p>'+
+      '<p style="font-size:11px;color:var(--gray);margin-bottom:6px;">'+t('driveNote')+'</p>'+
       (driveLink?'<a href="'+driveLink+'" target="_blank" style="color:var(--teal);font-size:12px;">'+t('openInDrive')+'</a>':'<span style="color:var(--gray);font-size:11px;">Sync once to get the link</span>')+
       '</div>'+
-      '<div style="display:flex;flex-direction:column;gap:10px;margin-top:14px;">'+
-      '<button class="btn btn-primary" data-a="syncAppToDrive">⬆ '+(lang==='he'?'אפליקציה → Drive':'App → Drive')+'</button>'+
-      '<p style="color:var(--gray);font-size:11px;text-align:center;margin:-4px 0 0;">'+(lang==='he'?'שולח עדכונים + תמונות':'Uploads workouts + images to Drive')+'</p>'+
-      '<button class="btn btn-ghost" data-a="syncDriveToApp">⬇ '+(lang==='he'?'Drive → אפליקציה':'Drive → App')+'</button>'+
-      '<p style="color:var(--gray);font-size:11px;text-align:center;margin:-4px 0 0;">'+(lang==='he'?'מוריד עדכונים + תמונות':'Downloads workouts + images from Drive')+'</p>'+
-      '</div>'+
-      '<p style="color:var(--gray);font-size:11px;text-align:center;margin-top:10px;">'+t('imgNote')+'</p>'+
+      _sdCard('toDrive',
+        '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>',
+        lang==='he'?'אפליקציה → Drive':'App → Drive',
+        lang==='he'?'שולח אימונים + תמונות ל-Drive':'Uploads workouts + images to Drive')+
+      _sdCard('toApp',
+        '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>',
+        lang==='he'?'Drive → אפליקציה':'Drive → App',
+        lang==='he'?'מוריד אימונים + תמונות מ-Drive':'Downloads workouts + images from Drive')+
+      '<p style="color:var(--gray);font-size:10px;text-align:center;margin-top:8px;">'+t('imgNote')+'</p>'+
       '<div class="mt-12"><button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button></div>';
   } else if(S.modal.type==='programs'){
     const rows=_programs.map(p=>{
-      const wCount=(JSON.parse(localStorage.getItem(skP('workouts',p.key))||'[]')||[]).length;
+      const wData=localStorage.getItem(skP('workouts',p.key));
+      const wCount=wData?JSON.parse(wData).length:0;
       const isActive=p.key===_activeProg;
-      return '<div class="prog-row'+(isActive?' prog-active':'')+'">'+
-        '<div class="prog-row-info">'+
-        '<span class="prog-row-name">'+esc(p.name)+(isActive?' <span class="prog-badge">'+t('activeProg')+'</span>':'')+'</span>'+
-        '<span class="prog-row-count">'+(wCount||0)+' '+t('workouts')+'</span>'+
-        '</div><div class="prog-row-btns">'+
-        (!isActive?'<button class="btn-sm-yellow" data-a="loadProg" data-key="'+p.key+'">'+t('loadProg')+'</button>':'')+
-        '<button class="btn-sm-ghost" data-a="renameProg" data-key="'+p.key+'">✏️</button>'+
-        (!isActive?'<button class="btn-sm-ghost" data-a="deleteProg" data-key="'+p.key+'">🗑️</button>':'')+
-        '</div></div>';
+      return '<div class="prog-card'+(isActive?' prog-card-active':'')+'">'+
+        '<div class="prog-card-header">'+
+        '<div>'+
+        '<div class="prog-card-name">'+esc(p.name)+
+          (isActive?'<span class="prog-badge" style="margin-left:8px;">✓ '+t('activeProg')+'</span>':'')+
+        '</div>'+
+        '<div class="prog-card-meta">'+wCount+' '+t('workouts')+(p.driveFileId?
+          ' · <span style="color:var(--teal);font-size:10px;">☁ Drive</span>':'')+
+        '</div>'+
+        '</div>'+
+        '</div>'+
+        '<div class="prog-card-actions">'+
+        (!isActive?'<button class="prog-btn prog-btn-load" data-a="loadProg" data-key="'+p.key+'">▶ '+t('loadProg')+'</button>':
+          '<span class="prog-active-label">Current</span>')+
+        '<button class="prog-btn prog-btn-ghost" data-a="renameProg" data-key="'+p.key+'">✏ Rename</button>'+
+        (!isActive?'<button class="prog-btn prog-btn-danger" data-a="deleteProg" data-key="'+p.key+'">🗑</button>':'')+
+        '</div>'+
+        '</div>';
     }).join('');
-    inner='<div class="modal-title">'+t('programs')+'</div>'+rows+
+    inner='<div class="modal-title">📋 '+t('programs')+'</div>'+rows+
       '<button class="btn-add" data-a="newProgram" style="margin-top:12px;">'+t('newProgram')+'</button>'+
       '<div class="mt-12"><button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button></div>';
+  } else if(S.modal.type==='syncError'){
+    const errMsg=S.modal.data.msg||'Unknown error';
+    const errDir=S.modal.data.dir||'toDrive';
+    inner='<div class="modal-title" style="color:var(--orange);">⚠ Sync Failed</div>'+
+      '<p style="color:var(--gray);font-size:13px;text-align:center;margin-bottom:20px;">'+esc(errMsg)+'</p>'+
+      '<div style="display:flex;flex-direction:column;gap:10px;">'+
+      '<button class="btn btn-primary" data-a="retrySyncError">↻ Retry</button>'+
+      '<button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button>'+
+      '</div>';
+  } else if(S.modal.type==='driveNotFound'){
+    const fname2=S.modal.data.fname||_progDriveFilename();
+    inner='<div class="modal-title" style="color:var(--orange);">⚠ File Not Found</div>'+
+      '<p style="color:var(--gray);font-size:13px;text-align:center;margin-bottom:20px;">"'+esc(fname2)+'" was not found in your<br><strong>NextUp Workouts</strong> folder on Drive.</p>'+
+      '<div style="display:flex;flex-direction:column;gap:10px;">'+
+      '<button class="btn btn-primary" data-a="driveNotFoundCreate">'+
+        '<div style="font-size:15px;font-weight:700;">⬆ Upload from App</div>'+
+        '<div style="font-size:11px;opacity:.75;margin-top:2px;">Create the file from current workouts</div>'+
+      '</button>'+
+      '<button class="btn btn-ghost" data-a="closeModal">'+t('cancel')+'</button>'+
+      '</div>';
   } else if(S.modal.type==='profile'){
     inner=buildProfileModal();
   }
@@ -970,9 +1104,16 @@ document.addEventListener('click',function(e){
   if(a==='exitW')        {if(confirm(t('exitWorkout'))){stopRest();go('home');}return;}
   if(a==='signOut')      {signOut();closeModal();return;}
   if(a==='signInGoogle') {signInWithGoogle();return;}
-  if(a==='syncNow')      {openModal('syncDrive',{});return;}
-  if(a==='syncAppToDrive'){closeModal();syncAppToDrive();return;}
-  if(a==='syncDriveToApp'){closeModal();syncDriveToApp();return;}
+  if(a==='syncNow')           {openModal('syncDrive',{});return;}
+  if(a==='preSyncDir')        {
+    S.modal.data.confirm=S.modal.data.confirm===T.dataset.dir?null:T.dataset.dir;
+    renderModal();return;
+  }
+  if(a==='cancelSyncConfirm') {S.modal.data.confirm=null;renderModal();return;}
+  if(a==='doSync')            {const dir=T.dataset.dir;closeModal();if(dir==='toApp')syncDriveToApp();else syncAppToDrive();return;}
+  // legacy direct calls (still used in checkDriveOnLogin)
+  if(a==='syncAppToDrive')    {closeModal();syncAppToDrive();return;}
+  if(a==='syncDriveToApp')    {closeModal();syncDriveToApp();return;}
   if(a==='toggleMute')   {_toggleMute();return;}
   if(a==='editW')        {S.edit.workoutIdx=+T.dataset.idx;S.screen='edit';render();return;}
   if(a==='backEdit')     {S.screen='edit';render();return;}
@@ -1011,12 +1152,14 @@ document.addEventListener('click',function(e){
   if(a==='renameProg')   {
     const rp=_programs.find(p=>p.key===T.dataset.key);if(!rp)return;
     const rn=prompt(t('progName'),rp.name);
-    if(rn&&rn.trim()){_renameProgram(T.dataset.key,rn.trim());renderModal();}return;
+    if(rn&&rn.trim()){_renameProgram(T.dataset.key,rn.trim()).then(()=>renderModal());}return;
   }
   if(a==='newProgram')   {
     const pn=prompt(t('progName')+':','');
     if(pn&&pn.trim()){_createProgram(pn.trim());closeModal();}return;
   }
+  if(a==='driveNotFoundCreate'){closeModal();syncAppToDrive();return;}
+  if(a==='retrySyncError')    {const d=S.modal.data.dir;closeModal();if(d==='toApp')syncDriveToApp();else syncAppToDrive();return;}
 });
 
 // ─── INIT ────────────────────────────────────────────────────

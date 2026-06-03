@@ -365,3 +365,80 @@ input[type=number] { -moz-appearance:textfield; }
   background:var(--sec); border-radius:10px; padding:12px 14px;
   border-left:3px solid var(--teal);
 }
+
+/* ─── Sync Status Icons ───────────────────────────────────── */
+@keyframes spin { to { transform:rotate(360deg); } }
+.sico {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:30px; height:30px; border-radius:50%;
+  font-size:15px; font-weight:700; cursor:pointer; flex-shrink:0;
+  transition:transform .15s;
+}
+.sico:active { transform:scale(.9); }
+.sico-idle  { background:var(--sec);  color:var(--gray); }
+.sico-spin  { background:#0d2540; color:#4A9EFF; animation:spin 1.2s linear infinite; }
+.sico-ok    { background:#0d3320; color:#2ecc71; }
+.sico-err   { background:#3a1000; color:#FF4A1C; }
+
+/* ─── Sync Direction Cards ────────────────────────────────── */
+.sync-dir-card {
+  display:flex; align-items:center; gap:14px;
+  background:var(--sec); border:1.5px solid var(--sec);
+  border-radius:14px; padding:16px 14px;
+  cursor:pointer; transition:all .2s; margin-bottom:2px;
+}
+.sync-dir-card:active  { border-color:var(--yellow); background:rgba(230,253,30,.06); }
+.sync-dir-card.confirming { border-color:var(--yellow); background:rgba(230,253,30,.08); }
+.sync-dir-arrow { color:var(--yellow); flex-shrink:0; }
+.sync-dir-text  { flex:1; }
+.sync-dir-title { font-size:14px; font-weight:700; color:var(--white); margin-bottom:2px; }
+.sync-dir-desc  { font-size:11px; color:var(--gray); }
+.sync-dir-chevron { color:var(--gray); font-size:11px; flex-shrink:0; }
+.sync-dir-card.confirming .sync-dir-chevron { color:var(--yellow); }
+.sync-dir-card.confirming .sync-dir-title { color:var(--yellow); }
+
+/* Confirmation box below the card */
+.sync-confirm-box {
+  background:rgba(230,253,30,.06); border:1px solid rgba(230,253,30,.3);
+  border-radius:0 0 12px 12px; border-top:none;
+  padding:14px; margin-bottom:10px; margin-top:-4px;
+}
+.sync-confirm-msg {
+  font-size:12px; color:var(--white); margin-bottom:12px; line-height:1.5;
+}
+.sync-confirm-btns { display:flex; gap:8px; }
+.sync-confirm-cancel { flex:1; font-size:13px; padding:10px; }
+.sync-confirm-go {
+  flex:1; background:var(--yellow); color:var(--bg); border:none;
+  border-radius:10px; padding:10px; font-size:13px; font-weight:700;
+  font-family:inherit; cursor:pointer;
+}
+.sync-modal-title {
+  display:flex; align-items:center; justify-content:center;
+  font-size:18px; font-weight:600; margin-bottom:16px;
+}
+
+/* ─── Program Cards (redesigned) ─────────────────────────── */
+.prog-card {
+  background:var(--sec); border:1.5px solid var(--sec);
+  border-radius:12px; padding:14px; margin-bottom:8px;
+  transition:border-color .2s;
+}
+.prog-card-active { border-color:var(--yellow); background:rgba(230,253,30,.04); }
+.prog-card-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+.prog-card-name { font-size:15px; font-weight:700; color:var(--white); }
+.prog-card-meta { font-size:11px; color:var(--gray); margin-top:3px; }
+.prog-card-actions { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.prog-btn {
+  border:none; border-radius:8px; padding:7px 12px;
+  font-size:12px; font-weight:600; font-family:inherit; cursor:pointer;
+  transition:opacity .15s;
+}
+.prog-btn:active { opacity:.7; }
+.prog-btn-load   { background:var(--yellow); color:var(--bg); }
+.prog-btn-ghost  { background:var(--card); color:var(--gray); border:1px solid var(--sec); }
+.prog-btn-danger { background:transparent; color:var(--orange); border:1px solid rgba(255,74,28,.3); }
+.prog-active-label {
+  font-size:11px; color:var(--yellow); background:rgba(230,253,30,.1);
+  border:1px solid rgba(230,253,30,.3); border-radius:6px; padding:4px 10px; font-weight:600;
+}
