@@ -388,12 +388,13 @@ async function _syncImgsFromDrive(tok,imgFid){
     for(const f of d.files){
       const imgKey=f.name.replace(/\.jpg$/,'');
       const localKey=sk('img_'+imgKey);
-      if(!localStorage.getItem(localKey)){
+      try{
         const fr=await fetch('https://www.googleapis.com/drive/v3/files/'+f.id+'?alt=media',{headers:{Authorization:'Bearer '+tok}});
         const buf=await fr.arrayBuffer();
-        const b64=btoa(String.fromCharCode(...new Uint8Array(buf)));
+        const arr=new Uint8Array(buf);let b64='';
+        const chunk=8192;for(let i=0;i<arr.length;i+=chunk)b64+=btoa(String.fromCharCode(...arr.slice(i,i+chunk)));
         localStorage.setItem(localKey,'data:image/jpeg;base64,'+b64);
-      }
+      }catch(ie){console.warn('img dl',imgKey,ie);}
     }
   }catch(e){console.warn('img sync from drive',e);}
 }
@@ -424,7 +425,7 @@ function _xlsBytesToWorkouts(bytes){
     gx.push({id:gx.length+1,name:n,sets:parseInt(r[3])||3,reps:String(r[4]||'10').trim(),weight:parseFloat(r[5])||0,rest:parseInt(r[6])||60,notes:String(r[7]||'').trim()});
   });
   if(!order.length)return null;
-  return order.map(gn=>({key:'xls_'+gn.replace(/\s+/g,'_').toLowerCase()+'_'+Date.now(),...groups[gn]}));
+  return order.map(gn=>({key:'xls_'+gn.replace(/\s+/g,'_').toLowerCase(),...groups[gn]}));
 }
 
 async function syncAppToDrive(){
@@ -433,7 +434,6 @@ async function syncAppToDrive(){
   try{
     const{fid,imgFid}=await _ensureFolders(tok);
     const uid=currentUser?currentUser.id:'guest';
-    // Upload ALL programs
     let uploadedCount=0;
     const savedActiveProg=_activeProg;
     for(const prog of _programs){
@@ -460,7 +460,7 @@ async function syncAppToDrive(){
     await _syncImgsToDrive(tok,imgFid);
     await _saveManifest(tok,fid);
     _setSyncStatus('ok');
-    alert('\u2705 Synced to Drive\n\ud83d\udccb '+uploadedCount+' program'+(uploadedCount!==1?'s':'')+' uploaded\n\ud83d\udc64 Profile saved\n\ud83d\udcf7 Images synced\n\nOpen any file in Google Sheets, then use Drive \u2192 App to sync back.');
+    alert('✅ Synced to Drive\n📋 '+uploadedCount+' program'+(uploadedCount!==1?'s':'')+' uploaded\n👤 Profile saved\n📷 Images synced\n\nOpen any file in Google Sheets, then use Drive → App to sync back.');
   }catch(e){console.error('syncAppToDrive',e);_setSyncStatus('error');openModal('syncError',{msg:e.message,dir:'toDrive'});}
 }
 
@@ -543,45 +543,21 @@ async function checkDriveOnLogin(){
   _setSyncStatus('syncing');
   try{
     const{fid,imgFid}=await _ensureFolders(tok);
-
-    // Drive is the source of truth: load manifest first
     const manifest=await _loadManifest(tok,fid);
     if(manifest){
-      // REPLACE local programs with Drive list
       if(manifest.programs&&manifest.programs.length){
         _programs=manifest.programs.map(p=>Object.assign({driveFileId:null},p));
         if(!_programs.find(p=>p.key===_activeProg))_activeProg=_programs[0].key;
         _savePrograms();
       }
-      // Restore profile
-      if(manifest.profile&&(manifest.profile.name||manifest.profile.weight||manifest.profile.height)){
-        saveProfile(manifest.profile);
-      }
+      if(manifest.profile&&(manifest.profile.name||manifest.profile.weight||manifest.profile.height))saveProfile(manifest.profile);
       render();
     }
-
-    // Discover any xlsx files in Drive not yet in programs list
     try{
-      const lr=await fetch(
-        'https://www.googleapis.com/drive/v3/files?q='+
-        encodeURIComponent("'"+fid+"' in parents and name contains '.xlsx' and trashed=false")+
-        '&fields=files(id,name)',
-        {headers:{Authorization:'Bearer '+tok}});
-      const ld=await lr.json();
-      let filesChanged=false;
-      if(ld.files){
-        ld.files.forEach(f=>{
-          const pName=f.name.replace(/\.xlsx$/i,'');
-          let existing=_programs.find(p=>p.driveFileId===f.id);
-          if(!existing)existing=_programs.find(p=>p.name===pName);
-          if(!existing){_programs.push({key:'drv_'+Date.now()+'_'+Math.random().toString(36).slice(2),name:pName,driveFileId:f.id});filesChanged=true;}
-          else if(!existing.driveFileId){existing.driveFileId=f.id;filesChanged=true;}
-        });
-        if(filesChanged){_savePrograms();render();}
-      }
+      const lr=await fetch('https://www.googleapis.com/drive/v3/files?q='+encodeURIComponent("'"+fid+"' in parents and name contains '.xlsx' and trashed=false")+'&fields=files(id,name)',{headers:{Authorization:'Bearer '+tok}});
+      const ld=await lr.json();let fc=false;
+      if(ld.files){ld.files.forEach(f=>{const pName=f.name.replace(/\.xlsx$/i,'');let ex=_programs.find(p=>p.driveFileId===f.id);if(!ex)ex=_programs.find(p=>p.name===pName);if(!ex){_programs.push({key:'drv_'+Date.now()+'_'+Math.random().toString(36).slice(2),name:pName,driveFileId:f.id});fc=true;}else if(!ex.driveFileId){ex.driveFileId=f.id;fc=true;}});if(fc){_savePrograms();render();}}
     }catch(e){console.warn('discover xlsx',e);}
-
-    // Load ALL programs' workouts from Drive
     const uid=currentUser?currentUser.id:'guest';
     let loadedCount=0;
     const savedActiveProg=_activeProg;
@@ -598,7 +574,7 @@ async function checkDriveOnLogin(){
         localStorage.setItem('nu_'+uid+'_p_'+prog.key+'_workouts',JSON.stringify(workouts));
         localStorage.setItem('nu_'+uid+'_drive_link_'+prog.key,'https://drive.google.com/file/d/'+prog.driveFileId+'/view');
         loadedCount++;
-        if(prog.key===savedActiveProg){S.workouts=workouts;}
+        if(prog.key===savedActiveProg)S.workouts=workouts;
       }catch(e){console.warn('load prog',prog.name,e);}
     }
     _activeProg=savedActiveProg;
@@ -607,14 +583,11 @@ async function checkDriveOnLogin(){
       _setSyncStatus('ok');render();
       alert('✅ Loaded from Drive\n📋 '+loadedCount+' program'+(loadedCount!==1?'s':'')+' synced\n👤 Profile restored');
     } else {
-      // No Drive files yet - upload current local state
-      const bytes=_workoutsToXlsBytes();
-      const fname=_progDriveFilename();
+      const bytes=_workoutsToXlsBytes();const fname=_progDriveFilename();
       if(bytes){
         const uploadedId=await _uploadDrive(tok,bytes,null,fid,fname);
         localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+uploadedId+'/view');
-        await _saveManifest(tok,fid);
-        _setSyncStatus('ok');
+        await _saveManifest(tok,fid);_setSyncStatus('ok');
         alert('Created "'+DRIVE_FOLDER_NAME+'/'+fname+'" on Google Drive.');
       }
     }
@@ -631,6 +604,24 @@ const S={
 
 // ─── Speech ─────────────────────────────────────────────────
 let _speechUnlocked=false;
+let _wakeLock=null;
+async function _requestWakeLock(){
+  if(!('wakeLock' in navigator))return;
+  try{if(_wakeLock)return;_wakeLock=await navigator.wakeLock.request('screen');
+    _wakeLock.addEventListener('release',()=>{_wakeLock=null;});}
+  catch(e){console.warn('wakeLock',e);}
+}
+function _releaseWakeLock(){if(_wakeLock){_wakeLock.release();_wakeLock=null;}}
+let _audioCtx=null;
+function _getAudioCtx(){if(!_audioCtx||_audioCtx.state==='closed')_audioCtx=new(window.AudioContext||window.webkitAudioContext)();return _audioCtx;}
+function _beep(freq,dur,vol){
+  try{const ctx=_getAudioCtx();if(ctx.state==='suspended')ctx.resume();
+    const osc=ctx.createOscillator();const gain=ctx.createGain();
+    osc.connect(gain);gain.connect(ctx.destination);
+    osc.frequency.value=freq||880;gain.gain.value=vol||0.4;
+    osc.start();osc.stop(ctx.currentTime+(dur||0.15));
+  }catch(e){}
+}
 function _unlockSpeech(){
   if(_speechUnlocked||!window.speechSynthesis)return;
   const u=new SpeechSynthesisUtterance('');u.volume=0;u.rate=2;
@@ -1021,15 +1012,15 @@ function startRest(sec,onDone){
   S.rest.timer=setInterval(()=>{
     S.rest.remaining--;
     const r=S.rest.remaining;
-    if(r===10&&S.rest.total>=14)_speak(t('tenSecsLeft'));
-    if(r===3)_speak(t('countThree'));
-    if(r===2)_speak(t('countTwo'));
-    if(r===1)_speak(t('countOne'));
-    if(r<=0){_speak(t('goNow'));const d=S.rest.onDone;S.rest.onDone=null;stopRest();if(d)d();else{S.screen='workout';render();}}
+    if(r===10&&S.rest.total>=14){_beep(660,0.12);_speak(t('tenSecsLeft'));}
+    if(r===3)_beep(880,0.1);
+    if(r===2)_beep(880,0.1);
+    if(r===1)_beep(880,0.15);
+    if(r<=0){_beep(1100,0.3);_speak(t('goNow'));const d=S.rest.onDone;S.rest.onDone=null;stopRest();if(d)d();else{S.screen='workout';render();}}
     else renderRest();
   },1000);
 }
-function stopRest(){if(S.rest.timer){clearInterval(S.rest.timer);S.rest.timer=null;}}
+function stopRest(){if(S.rest.timer){clearInterval(S.rest.timer);S.rest.timer=null;}S.rest.remaining=0;_releaseWakeLock();}
 function skipRest(){const d=S.rest.onDone;S.rest.onDone=null;stopRest();if(d)d();else{S.screen='workout';render();}}
 
 // ─── WORKOUT SESSION ─────────────────────────────────────────
@@ -1037,6 +1028,7 @@ function startWorkout(wi){S.session={workoutIdx:wi,exerciseIdx:0,setNum:1};S.scr
 
 function doSet(){
   _unlockSpeech();
+  _requestWakeLock();
   const{workoutIdx:wi,exerciseIdx:ei,setNum}=S.session;
   const w=S.workouts[wi],ex=w.exercises[ei];
   const lastSet=setNum===ex.sets,lastEx=ei===w.exercises.length-1;
@@ -1053,7 +1045,7 @@ function finish(){
   const w=S.workouts[S.session.workoutIdx];
   S.history.unshift({key:w.key,date:new Date().toLocaleDateString(lang==='he'?'he-IL':'en-US',{month:'short',day:'numeric'}),ts:Date.now()});
   if(S.history.length>20)S.history.length=20;
-  saveHistory();S.screen='finish';render();
+  saveHistory();_releaseWakeLock();S.screen='finish';render();
 }
 
 // ─── IMAGE CROPPER ───────────────────────────────────────────
