@@ -411,9 +411,9 @@ function _workoutsToXlsBytes(){
 
 function _xlsBytesToWorkouts(bytes){
   if(typeof XLSX==='undefined')return null;
-  const wb=XLSX.read(bytes,{type:'array'});
+  const wb=XLSX.read(bytes,{type:'array',raw:false,cellText:true});
   const ws=wb.Sheets[wb.SheetNames[0]];
-  const rows=XLSX.utils.sheet_to_json(ws,{header:1});
+  const rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:false});
   if(!rows||rows.length<2)return null;
   const groups={},order=[];
   rows.slice(1).filter(r=>r[0]&&r[2]).forEach(r=>{
@@ -432,97 +432,40 @@ async function syncAppToDrive(){
   _setSyncStatus('syncing');
   try{
     const{fid,imgFid}=await _ensureFolders(tok);
-    const bytes=_workoutsToXlsBytes();if(!bytes)throw new Error('SheetJS not loaded');
-    const fname=_progDriveFilename();
-    const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
-    const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
-    const sd=await sr.json();
-    const existId=sd.files&&sd.files.length?sd.files[0].id:null;
-    const uploadedId=await _uploadDrive(tok,bytes,existId,fid,fname);
-    // Save file ID in the program object so rename/sync always finds the right file
-    const progObj=_getActiveProg();
-    if(progObj){progObj.driveFileId=uploadedId;_savePrograms();}
-    localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+uploadedId+'/view');
+    const uid=currentUser?currentUser.id:'guest';
+
+    // Upload ALL programs (not just the active one)
+    let uploadedCount=0;
+    const savedActiveProg=_activeProg;
+    for(const prog of _programs){
+      _activeProg=prog.key;
+      const rawW=localStorage.getItem(skP('workouts',prog.key))||localStorage.getItem(sk('workouts'));
+      if(!rawW){continue;}
+      const savedWorkouts=S.workouts;
+      S.workouts=JSON.parse(rawW);
+      const bytes=_workoutsToXlsBytes();
+      S.workouts=savedWorkouts;
+      if(!bytes)continue;
+      const fname=(prog.name||'Workouts')+'.xlsx';
+      const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
+      const sr2=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
+      const sd2=await sr2.json();
+      const existId=prog.driveFileId||(sd2.files&&sd2.files.length?sd2.files[0].id:null);
+      const uploadedId=await _uploadDrive(tok,bytes,existId,fid,fname);
+      prog.driveFileId=uploadedId;
+      localStorage.setItem('nu_'+uid+'_drive_link_'+prog.key,'https://drive.google.com/file/d/'+uploadedId+'/view');
+      uploadedCount++;
+    }
+    _activeProg=savedActiveProg;
+    _savePrograms();
+
     await _syncImgsToDrive(tok,imgFid);
-    await _saveManifest(tok,fid); // save programs list + profile
+    await _saveManifest(tok,fid); // saves programs list + profile + age + height
     _setSyncStatus('ok');
-    alert('✅ Synced to Drive\n📊 '+fname+'\n\nOpen in Google Sheets to edit, then use Drive → App to sync back.');
+    alert('\u2705 Synced to Drive\n\ud83d\udccb '+uploadedCount+' program'+(uploadedCount!==1?'s':'')+' uploaded\n\ud83d\udc64 Profile saved\n\ud83d\udcf7 Images synced\n\nOpen any file in Google Sheets, then use Drive \u2192 App to sync back.');
   }catch(e){console.error('syncAppToDrive',e);_setSyncStatus('error');openModal('syncError',{msg:e.message,dir:'toDrive'});}
 }
 
-// ── programs.json manifest — stores programs list + profile ──
-async function _saveManifest(tok,fid){
-  try{
-    const manifest=JSON.stringify({
-      version:2,
-      programs:_programs,
-      activeProgram:_activeProg,
-      profile:getProfile(),
-      savedAt:new Date().toISOString()
-    });
-    const blob=new Blob([manifest],{type:'application/json'});
-    const q=encodeURIComponent("name='programs.json' and '"+fid+"' in parents and trashed=false");
-    const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+q+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
-    const sd=await sr.json();
-    if(sd.files&&sd.files.length){
-      await fetch('https://www.googleapis.com/upload/drive/v3/files/'+sd.files[0].id+'?uploadType=media',{method:'PATCH',headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},body:blob});
-    } else {
-      const meta={name:'programs.json',parents:[fid]};
-      const cr=await fetch('https://www.googleapis.com/drive/v3/files',{method:'POST',headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},body:JSON.stringify(meta)});
-      const newId=(await cr.json()).id;
-      await fetch('https://www.googleapis.com/upload/drive/v3/files/'+newId+'?uploadType=media',{method:'PATCH',headers:{Authorization:'Bearer '+tok,'Content-Type':'application/json'},body:blob});
-    }
-  }catch(e){console.warn('saveManifest',e);}
-}
-
-async function _loadManifest(tok,fid){
-  try{
-    const q=encodeURIComponent("name='programs.json' and '"+fid+"' in parents and trashed=false");
-    const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+q+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
-    const sd=await sr.json();
-    if(!sd.files||!sd.files.length)return null;
-    const r=await fetch('https://www.googleapis.com/drive/v3/files/'+sd.files[0].id+'?alt=media',{headers:{Authorization:'Bearer '+tok}});
-    return await r.json();
-  }catch(e){console.warn('loadManifest',e);return null;}
-}
-
-async function syncDriveToApp(){
-  const tok=getToken();if(!tok||!currentUser){alert('Please log in first');return;}
-  _setSyncStatus('syncing');
-  try{
-    const{fid,imgFid}=await _ensureFolders(tok);
-    const fname=_progDriveFilename();
-    const progObj=_getActiveProg();
-    let fileId=null;
-    // Try cached driveFileId first (survives renames)
-    if(progObj&&progObj.driveFileId){
-      const chk=await fetch('https://www.googleapis.com/drive/v3/files/'+progObj.driveFileId+'?fields=id',{headers:{Authorization:'Bearer '+tok}});
-      if(chk.ok) fileId=progObj.driveFileId;
-      else{ if(progObj)progObj.driveFileId=null; _savePrograms(); }
-    }
-    // Fallback: search by filename
-    if(!fileId){
-      const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
-      const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
-      const sd=await sr.json();
-      if(sd.files&&sd.files.length){
-        fileId=sd.files[0].id;
-        if(progObj){progObj.driveFileId=fileId;_savePrograms();}
-      }
-    }
-    if(!fileId){_setSyncStatus('error');openModal('driveNotFound',{fname});return;}
-    localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+fileId+'/view');
-    const r=await fetch('https://www.googleapis.com/drive/v3/files/'+fileId+'?alt=media',{headers:{Authorization:'Bearer '+tok}});
-    if(!r.ok)throw new Error('download '+r.status);
-    const buf=await r.arrayBuffer();
-    const workouts=_xlsBytesToWorkouts(new Uint8Array(buf));
-    if(!workouts)throw new Error('Could not parse Excel file');
-    S.workouts=workouts;saveWorkouts();
-    await _syncImgsFromDrive(tok,imgFid);
-    _setSyncStatus('ok');render();
-    alert('✅ Loaded from Drive\n📊 '+fname+'\nImages also synced.');
-  }catch(e){console.error('syncDriveToApp',e);_setSyncStatus('error');openModal('syncError',{msg:e.message,dir:'toApp'});}
-}
 
 async function checkDriveOnLogin(){
   const tok=getToken();if(!tok||!currentUser)return;
@@ -984,7 +927,7 @@ function handleImport(e){
   rd.onload=function(ev){
     try{
       let rows;
-      if(isX&&typeof XLSX!=='undefined'){const wb=XLSX.read(ev.target.result,{type:'array'});rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1});}
+      if(isX&&typeof XLSX!=='undefined'){const wb=XLSX.read(ev.target.result,{type:'array',raw:false,cellText:true});rows=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,raw:false});}
       else{rows=parseCSV(typeof ev.target.result==='string'?ev.target.result:new TextDecoder().decode(ev.target.result));}
       if(!rows||rows.length<2){alert('No data found');return;}
       const data=rows.slice(1).filter(r=>r[0]&&r[2]);
