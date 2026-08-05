@@ -201,6 +201,46 @@ function getToken(){
 }
 
 // ─── Programs ───────────────────────────────────────────────
+// Silent token refresh using hidden iframe (avoids sign-out/in cycle)
+function _silentRefreshToken(){
+  return new Promise(resolve=>{
+    if(typeof GOOGLE_CLIENT_ID==='undefined'||!GOOGLE_CLIENT_ID){resolve(false);return;}
+    const redir=window.location.origin+window.location.pathname;
+    const p=new URLSearchParams({client_id:GOOGLE_CLIENT_ID,redirect_uri:redir,
+      response_type:'token',scope:'openid email profile https://www.googleapis.com/auth/drive.file',
+      prompt:'none'});
+    const iframe=document.createElement('iframe');
+    iframe.style.cssText='position:fixed;width:0;height:0;border:0;visibility:hidden;';
+    iframe.src='https://accounts.google.com/o/oauth2/v2/auth?'+p;
+    let done=false;
+    const finish=(ok)=>{if(done)return;done=true;try{document.body.removeChild(iframe);}catch(e){}resolve(ok);};
+    iframe.onload=()=>{
+      try{
+        const h=iframe.contentWindow.location.hash;
+        if(h&&h.includes('access_token')){
+          const tok=new URLSearchParams(h.slice(1)).get('access_token');
+          if(tok){storeToken(tok);finish(true);return;}
+        }
+      }catch(e){}
+      finish(false);
+    };
+    setTimeout(()=>finish(false),8000);
+    document.body.appendChild(iframe);
+  });
+}
+// Try silent refresh first, then ask user to re-sign-in if that fails
+async function _ensureToken(){
+  let tok=getToken();
+  if(tok)return tok;
+  _setSyncStatus('syncing');
+  const ok=await _silentRefreshToken();
+  tok=getToken();
+  if(ok&&tok)return tok;
+  _setSyncStatus('error');
+  if(confirm('Session expired. Sign in again?'))signInWithGoogle();
+  return null;
+}
+
 let _programs=[];
 let _activeProg='default';
 
@@ -282,7 +322,10 @@ function loadData(){
   if(!h)h=localStorage.getItem(sk('history'));
   S.history=h?JSON.parse(h):[];
 }
-function saveWorkouts(){localStorage.setItem(skP('workouts'),JSON.stringify(S.workouts));}
+function saveWorkouts(){
+  localStorage.setItem(skP('workouts'),JSON.stringify(S.workouts));
+  localStorage.setItem(skP('workouts_ts'),String(Date.now()));
+}
 function saveHistory(){localStorage.setItem(skP('history'),JSON.stringify(S.history));}
 function getImg(wk,id){return localStorage.getItem(sk('img_'+wk+'_'+id));}
 function setImg(wk,id,d){localStorage.setItem(sk('img_'+wk+'_'+id),d);}
@@ -488,7 +531,7 @@ function _xlsBytesToWorkouts(bytes){
 }
 
 async function syncAppToDrive(){
-  const tok=getToken();if(!tok||!currentUser){alert('Please log in first');return;}
+  const tok=await _ensureToken();if(!tok||!currentUser){return;}
   _setSyncStatus('syncing');
   try{
     const{fid,imgFid}=await _ensureFolders(tok);
@@ -518,6 +561,8 @@ async function syncAppToDrive(){
     _savePrograms();
     await _syncImgsToDrive(tok,imgFid);
     await _saveManifest(tok,fid);
+    // Mark last Drive sync time so login knows local data is not newer
+    localStorage.setItem('nu_'+uid+'_last_drive_sync',String(Date.now()));
     _setSyncStatus('ok');
     alert('✅ Synced to Drive\n📋 '+uploadedCount+' program'+(uploadedCount!==1?'s':'')+' uploaded\n👤 Profile saved\n📷 Images synced\n\nOpen any file in Google Sheets, then use Drive → App to sync back.');
   }catch(e){console.error('syncAppToDrive',e);_setSyncStatus('error');openModal('syncError',{msg:e.message,dir:'toDrive'});}
@@ -560,7 +605,7 @@ async function _loadManifest(tok,fid){
 }
 
 async function syncDriveToApp(){
-  const tok=getToken();if(!tok||!currentUser){alert('Please log in first');return;}
+  const tok=await _ensureToken();if(!tok||!currentUser){return;}
   _setSyncStatus('syncing');
   try{
     const{fid,imgFid}=await _ensureFolders(tok);
@@ -612,60 +657,89 @@ async function checkDriveOnLogin(){
       if(manifest.profile&&(manifest.profile.name||manifest.profile.weight||manifest.profile.height))saveProfile(manifest.profile);
       render();
     }
+    // Discover xlsx files on Drive not yet in programs list
     try{
       const lr=await fetch('https://www.googleapis.com/drive/v3/files?q='+encodeURIComponent("'"+fid+"' in parents and name contains '.xlsx' and trashed=false")+'&fields=files(id,name)',{headers:{Authorization:'Bearer '+tok}});
       const ld=await lr.json();let fc=false;
       if(ld.files){ld.files.forEach(f=>{const pName=f.name.replace(/\.xlsx$/i,'');let ex=_programs.find(p=>p.driveFileId===f.id);if(!ex)ex=_programs.find(p=>p.name===pName);if(!ex){_programs.push({key:'drv_'+Date.now()+'_'+Math.random().toString(36).slice(2),name:pName,driveFileId:f.id});fc=true;}else if(!ex.driveFileId){ex.driveFileId=f.id;fc=true;}});if(fc){_savePrograms();render();}}
     }catch(e){console.warn('discover xlsx',e);}
     const uid=currentUser?currentUser.id:'guest';
-    let loadedCount=0;
-    const savedActiveProg=_activeProg;
+    // Check for local data that is newer than last Drive sync
+    // If found, warn user instead of silently overwriting
+    const lastDriveSync=parseInt(localStorage.getItem('nu_'+uid+'_last_drive_sync')||'0');
+    let hasLocalNewer=false;
     for(const prog of _programs){
-      try{
-        // Resolve Drive file ID: use cached ID, or search by program name
-        let fileId=prog.driveFileId;
-        if(fileId){
-          const chk=await fetch('https://www.googleapis.com/drive/v3/files/'+fileId+'?fields=id',{headers:{Authorization:'Bearer '+tok}});
-          if(!chk.ok)fileId=null; // stale ID, fall through to name search
-        }
-        if(!fileId){
-          // Search Drive by filename: "<ProgramName>.xlsx"
-          const fname=(prog.name||'Workouts')+'.xlsx';
-          const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
-          const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
-          const sd=await sr.json();
-          if(sd.files&&sd.files.length)fileId=sd.files[0].id;
-        }
-        if(!fileId)continue; // truly not on Drive yet
-        const r=await fetch('https://www.googleapis.com/drive/v3/files/'+fileId+'?alt=media',{headers:{Authorization:'Bearer '+tok}});
-        if(!r.ok)continue;
-        const buf=await r.arrayBuffer();
-        const workouts=_xlsBytesToWorkouts(new Uint8Array(buf));
-        if(!workouts)continue;
-        // Cache the resolved file ID so future syncs are instant
-        prog.driveFileId=fileId;
-        _savePrograms();
-        localStorage.setItem('nu_'+uid+'_p_'+prog.key+'_workouts',JSON.stringify(workouts));
-        localStorage.setItem('nu_'+uid+'_drive_link_'+prog.key,'https://drive.google.com/file/d/'+fileId+'/view');
-        loadedCount++;
-        if(prog.key===savedActiveProg)S.workouts=workouts;
-      }catch(e){console.warn('load prog',prog.name,e);}
+      const ts=parseInt(localStorage.getItem('nu_'+uid+'_p_'+prog.key+'_workouts_ts')||localStorage.getItem('nu_'+uid+'_workouts_ts')||'0');
+      if(ts>lastDriveSync&&ts>0){hasLocalNewer=true;break;}
     }
-    _activeProg=savedActiveProg;
-    if(loadedCount>0){
-      await _syncImgsFromDrive(tok,imgFid);
-      _setSyncStatus('ok');render();
-      alert('✅ Loaded from Drive\n📋 '+loadedCount+' program'+(loadedCount!==1?'s':'')+' synced\n👤 Profile restored');
-    } else {
-      const bytes=_workoutsToXlsBytes();const fname=_progDriveFilename();
-      if(bytes){
-        const uploadedId=await _uploadDrive(tok,bytes,null,fid,fname);
-        localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+uploadedId+'/view');
-        await _saveManifest(tok,fid);_setSyncStatus('ok');
-        alert('Created "'+DRIVE_FOLDER_NAME+'/'+fname+'" on Google Drive.');
+    if(hasLocalNewer){
+      _setSyncStatus('ok');
+      const choice=confirm(
+        'You have local changes that were not uploaded yet.\n\n'
+        +'OK = Upload your changes to Drive\n'
+        +'Cancel = Load from Drive (your local changes will be lost)');
+      if(choice){
+        // User wants to upload their local changes
+        await syncAppToDrive();
+      } else {
+        // User wants Drive version - do normal download
+        await _doDownloadAllPrograms(tok,fid,imgFid,uid);
       }
+      return;
     }
+    // No local-newer conflict: just download Drive data normally
+    await _doDownloadAllPrograms(tok,fid,imgFid,uid);
   }catch(e){console.error('checkDriveOnLogin',e);_setSyncStatus('error');}
+}
+
+// Shared download logic used by checkDriveOnLogin and syncDriveToApp-on-login
+async function _doDownloadAllPrograms(tok,fid,imgFid,uid){
+  let loadedCount=0;
+  const savedActiveProg=_activeProg;
+  for(const prog of _programs){
+    try{
+      let fileId=prog.driveFileId;
+      if(fileId){
+        const chk=await fetch('https://www.googleapis.com/drive/v3/files/'+fileId+'?fields=id',{headers:{Authorization:'Bearer '+tok}});
+        if(!chk.ok)fileId=null;
+      }
+      if(!fileId){
+        const fname=(prog.name||'Workouts')+'.xlsx';
+        const qf=encodeURIComponent("name='"+fname+"' and '"+fid+"' in parents and trashed=false");
+        const sr=await fetch('https://www.googleapis.com/drive/v3/files?q='+qf+'&fields=files(id)',{headers:{Authorization:'Bearer '+tok}});
+        const sd=await sr.json();
+        if(sd.files&&sd.files.length)fileId=sd.files[0].id;
+      }
+      if(!fileId)continue;
+      const r=await fetch('https://www.googleapis.com/drive/v3/files/'+fileId+'?alt=media',{headers:{Authorization:'Bearer '+tok}});
+      if(!r.ok)continue;
+      const buf=await r.arrayBuffer();
+      const workouts=_xlsBytesToWorkouts(new Uint8Array(buf));
+      if(!workouts)continue;
+      prog.driveFileId=fileId;
+      _savePrograms();
+      localStorage.setItem('nu_'+uid+'_p_'+prog.key+'_workouts',JSON.stringify(workouts));
+      localStorage.setItem('nu_'+uid+'_drive_link_'+prog.key,'https://drive.google.com/file/d/'+fileId+'/view');
+      loadedCount++;
+      if(prog.key===savedActiveProg)S.workouts=workouts;
+    }catch(e){console.warn('load prog',prog.name,e);}
+  }
+  _activeProg=savedActiveProg;
+  if(loadedCount>0){
+    await _syncImgsFromDrive(tok,imgFid);
+    // Mark the Drive sync time so future logins know what was last synced
+    localStorage.setItem('nu_'+uid+'_last_drive_sync',String(Date.now()));
+    _setSyncStatus('ok');render();
+    alert('✅ Loaded from Drive\n📋 '+loadedCount+' program'+(loadedCount!==1?'s':'')+' synced\n👤 Profile restored');
+  } else {
+    const bytes=_workoutsToXlsBytes();const fname=_progDriveFilename();
+    if(bytes){
+      const uploadedId=await _uploadDrive(tok,bytes,null,fid,fname);
+      localStorage.setItem(sk('drive_link_'+_activeProg),'https://drive.google.com/file/d/'+uploadedId+'/view');
+      await _saveManifest(tok,fid);_setSyncStatus('ok');
+      alert('Created "'+DRIVE_FOLDER_NAME+'/'+fname+'" on Google Drive.');
+    }
+  }
 }
 
 const S={
